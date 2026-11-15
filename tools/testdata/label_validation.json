@@ -1,0 +1,27 @@
+{
+  "run_id": "unit_test_run",
+  "n_ops": 3,
+  "n_valid": 3,
+  "n_invalid": 0,
+  "label_noise_rate": 0.0,
+  "details": [
+    {
+      "op_id": 1,
+      "label": "IO_WAIT",
+      "valid": true,
+      "reason": ""
+    },
+    {
+      "op_id": 2,
+      "label": "SCHED_WAIT",
+      "valid": true,
+      "reason": ""
+    },
+    {
+      "op_id": 3,
+      "label": "SCHED_WAIT",
+      "valid": true,
+      "reason": ""
+    }
+  ]
+}

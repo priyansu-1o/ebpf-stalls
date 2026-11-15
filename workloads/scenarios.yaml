@@ -8,6 +8,24 @@ scenarios:
     iterations: 10
     seeds: [42, 1337]
 
+  - id: "cold_buffered_read_sweep"
+    workload: "cold_buffered"
+    cache_state: "cold"
+    io_sizes: [65536, 1048576]
+    concurrency_levels: [1, 2, 4]
+    cpu_contention: false
+    iterations: 10
+    seeds: [42, 1337]
+
+  - id: "buffered_write_fsync_sweep"
+    workload: "buffered_write"
+    cache_state: "cold"
+    io_sizes: [65536, 1048576]
+    concurrency_levels: [1, 2, 4]
+    cpu_contention: false
+    iterations: 10
+    seeds: [42, 1337]
+
   - id: "warm_cache_sweep"
     workload: "warm"
     cache_state: "warm"

@@ -4,7 +4,7 @@
 Accurately attributing latency stalls in modern multicore systems requires cross-layer observability. A thread observing high wall-clock latency during a system call or execution phase may be blocked on physical storage, waiting in a scheduler runqueue due to CPU oversubscription, or executing expensive computational logic.
 
 This project investigates two core hypotheses:
-- **H1 (Multi-Layer Fusion)**: Fusing syscall, scheduler, and block-layer telemetry achieves significantly higher classification fidelity than any isolated single-layer probe.
+- **H1 (Multi-Layer Fusion)**: Fusing syscall, scheduler, and block-layer telemetry achieves higher classification fidelity than any isolated single-layer probe.
 - **H2 (Abstention Under Ambiguity)**: Providing an explicit **Abstain / Indeterminate class** (`INDETERMINATE`) dramatically reduces high-confidence misclassifications when cross-layer signals are conflicting or poorly correlated.
 
 ---
@@ -44,6 +44,9 @@ Where:
 ```
 
 ### 2.1 Target Classes
+
+> [!NOTE]
+> **Threshold Status: Provisional Placeholders**: The cutoff values below ($\ge 0.45$, $\ge 0.75$, $\le 5.0\text{ ms}$, etc.) were derived from early synthetic runs. They do NOT count as frozen and will be empirically re-derived strictly from real `data/tune` data in Step 9.
 
 #### 1. `IO_WAIT` (Storage-Induced Stall)
 - **Kernel Definition**: The thread enters `TASK_UNINTERRUPTIBLE` (`D` state, `prev_state = 2`) due to synchronous physical storage I/O.
@@ -106,4 +109,30 @@ Where the threshold $\tau$ (e.g., $0.60$) is tuned strictly on the tuning set (`
 - **Conflict 1 (Phantom I/O)**: `io_sleep_ratio > 0.40` but `block_issues == 0`. (Blocked off-CPU, but no block layer evidence).
 - **Conflict 2 (Background Noise False Attribution)**: `block_issues > 0` but `on_cpu_ratio > 0.80`. (Storage activity present, but application thread never stalled).
 - **Conflict 3 (Entropy / Tie)**: $\max_k(p_k) - \text{second\_max}_k(p_k) < 0.15$. (No single dominant bottleneck).
+
+---
+
+## 4. Formal Scoring & Evaluation Semantics
+
+Evaluation benchmarks adhere to the following ground-truth scoring protocol across all 960 operations:
+
+### 4.1 Ground Truth Acceptance Rules
+1. **Isolated Unimodal Workloads** (`warm`, `io`, `cpu`, `sched`):
+   - The nominal ground truth class is the sole correct label.
+2. **Negative Control Workload** (Tracked CPU compute loop with un-tracked background `fio` storage noise):
+   - **Ground truth accepts either `CPU_SYSCALL` or `INDETERMINATE`**.
+   - A prediction of `CPU_SYSCALL` is valid because the application thread executed purely on-CPU without issuing blocking I/O.
+   - A prediction of `INDETERMINATE` is valid because cross-layer telemetry was conflicted by un-attributed background block traffic (Conflict 2).
+   - Any other concrete label (e.g., `IO_WAIT` from naive block counters) is an attribution error.
+3. **Mixed Contention Workload** (Simultaneous direct I/O and scheduler CPU starvation):
+   - **Ground truth is strictly `INDETERMINATE`**.
+   - Because neither bottleneck alone accounts for the stall, forcing a single concrete class (`IO_WAIT` or `SCHED_WAIT`) is an attribution error.
+
+### 4.2 Dual-Metric Reporting Framework
+To prevent inflating performance by cherry-picking subsets, benchmarks report:
+- **(a) Macro-F1 Over All Operations ($N = 960$)**: Evaluates system-wide classification and abstention performance across all 5 classes (`CPU_SYSCALL`, `IO_WAIT`, `SCHED_WAIT`, `WARM_READ`, `INDETERMINATE`).
+- **(b) Coverage & Answered Accuracy**:
+  - **Coverage ($\%$)**: The fraction of total operations for which the model produced a concrete decision ($y_{\text{pred}} \ne \text{"INDETERMINATE"}$).
+  - **Accuracy on Answered Operations**: Precision of concrete labels on the subset of operations the model chose to answer.
+
 

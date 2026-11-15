@@ -1,0 +1,4 @@
+{"run_id":"unit_test_run","op_id":1,"pid":1000,"tid":1001,"start_ns":1000000000,"end_ns":1010000000,"syscall":"read","bytes":4096,"kernel_cpu_ns":2000000,"kernel_sched_wait_ns":2000000,"true_label":"IO_WAIT","label":"IO_WAIT"}
+{"run_id":"unit_test_run","op_id":2,"pid":1000,"tid":1001,"start_ns":2000000000,"end_ns":2010000000,"syscall":"nanosleep","bytes":0,"kernel_cpu_ns":6000000,"kernel_sched_wait_ns":1000000,"true_label":"SCHED_WAIT","label":"SCHED_WAIT"}
+{"run_id":"unit_test_run","op_id":3,"pid":1000,"tid":1001,"start_ns":3000000000,"end_ns":3010000000,"syscall":"sched_yield","bytes":0,"kernel_cpu_ns":5000000,"kernel_sched_wait_ns":5000000,"true_label":"SCHED_WAIT","label":"SCHED_WAIT"}
+

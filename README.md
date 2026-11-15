@@ -102,6 +102,7 @@ does not parse that YAML or automatically launch the `fio` control.
 ```text
 .
 ├── Makefile                         # Builds/cleans tracer and harness
+├── requirements.txt                 # Python dependencies manifest
 ├── tracer/
 │   ├── bpf/                         # eBPF probes and shared event definitions
 │   ├── src/collector.c              # Loads BPF, launches target, writes CSV
@@ -177,19 +178,19 @@ The Makefile does not fetch or build libbpf for you.
 
 ### Python dependencies
 
-The repository does not include a Python dependency manifest. Python 3 is
-needed for orchestration and analysis. The core analysis/evaluation scripts
-use NumPy, pandas, scikit-learn, and Matplotlib; `eval/overhead.py` also uses
-psutil. PyArrow enables Parquet output, while correlation and rule scripts have
-CSV paths when Parquet support is unavailable.
-
-For example, in a Linux virtual environment:
+Python 3 is needed for orchestration and analysis. All required packages are
+specified in [`requirements.txt`](requirements.txt):
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install numpy pandas scikit-learn matplotlib psutil pyarrow
+pip install -r requirements.txt
 ```
+
+The core analysis and evaluation scripts use NumPy, pandas, scikit-learn, and
+Matplotlib; `eval/overhead.py` also uses psutil, and PyArrow enables Parquet
+output. Note that `numpy<2.0.0` is constrained in `requirements.txt` to maintain
+ABI compatibility with system SciPy builds.
 
 `PyYAML` is not currently required by the runner because it does not load
 `scenarios.yaml`.

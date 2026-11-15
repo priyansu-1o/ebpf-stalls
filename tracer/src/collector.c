@@ -34,9 +34,10 @@ static int handle_event(void *ctx, void *data, size_t sz)
     memcpy(rwbs_buf, e->rwbs, sizeof(e->rwbs));
 
     // CSV format:
-    // ts_ns,pid,tid,layer,type,syscall_nr,ret,prev_state,sector,dev,nr_bytes,cpu,target_tid,rwbs
+    // ts_ns,pid,tid,layer,type,syscall_nr,ret,prev_state,sector,dev,nr_bytes,cpu,target_tid,rwbs,dur_ns
+    unsigned long long dur_ns = (e->layer == LAYER_IRQ && e->ret > 0) ? (unsigned long long)e->ret : 0ULL;
     fprintf(out_fp ? out_fp : stdout,
-            "%llu,%u,%u,%u,%u,%u,%lld,%lld,%llu,%u,%u,%u,%u,%s\n",
+            "%llu,%u,%u,%u,%u,%u,%lld,%lld,%llu,%u,%u,%u,%u,%s,%llu\n",
             (unsigned long long)e->ts_ns,
             e->pid,
             e->tid,
@@ -50,7 +51,8 @@ static int handle_event(void *ctx, void *data, size_t sz)
             e->nr_bytes,
             e->cpu,
             e->target_tid,
-            rwbs_buf);
+            rwbs_buf,
+            dur_ns);
     return 0;
 }
 
@@ -233,7 +235,7 @@ int main(int argc, char **argv)
     }
 
     // Write CSV header
-    fprintf(out_fp, "ts_ns,pid,tid,layer,type,syscall_nr,ret,prev_state,sector,dev,nr_bytes,cpu,target_tid,rwbs\n");
+    fprintf(out_fp, "ts_ns,pid,tid,layer,type,syscall_nr,ret,prev_state,sector,dev,nr_bytes,cpu,target_tid,rwbs,dur_ns\n");
     fflush(out_fp);
 
     // If ready file requested, touch it to signal harness

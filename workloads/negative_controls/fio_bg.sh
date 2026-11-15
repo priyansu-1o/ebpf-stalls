@@ -20,7 +20,7 @@ fio --name=background_noise \
     --direct=1 \
     --numjobs=2 \
     --time_based \
-    --runtime=10 \
+    --runtime=60 \
     --group_reporting &
 FIO_PID=$!
 

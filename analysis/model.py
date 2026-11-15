@@ -17,13 +17,17 @@ import argparse
 import glob
 from pathlib import Path
 
+_site_pkg = Path(__file__).resolve().parent.parent / ".site-packages"
+if _site_pkg.exists() and str(_site_pkg) not in sys.path:
+    sys.path.insert(0, str(_site_pkg))
+
 try:
     import pandas as pd
     import numpy as np
     from sklearn.tree import DecisionTreeClassifier, export_text
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import GroupKFold
-    from sklearn.metrics import classification_report, accuracy_score
+    from sklearn.metrics import classification_report, accuracy_score, f1_score
 except ImportError as e:
     pd = None
     np = None
@@ -49,15 +53,19 @@ def load_dataset(directories):
         csv_file = p / "features.csv"
 
         df = None
-        if parquet_file.exists():
+        if csv_file.exists() and parquet_file.exists():
+            if csv_file.stat().st_mtime >= parquet_file.stat().st_mtime:
+                df = pd.read_csv(csv_file)
+            else:
+                try:
+                    df = pd.read_parquet(parquet_file)
+                except Exception:
+                    df = pd.read_csv(csv_file)
+        elif csv_file.exists():
+            df = pd.read_csv(csv_file)
+        elif parquet_file.exists():
             try:
                 df = pd.read_parquet(parquet_file)
-            except Exception:
-                pass
-
-        if df is None and csv_file.exists():
-            try:
-                df = pd.read_csv(csv_file)
             except Exception:
                 pass
 
@@ -205,18 +213,137 @@ def write_predictions_by_dir(predictions, out_filename="pred_tree.jsonl"):
             print(f"[model] error: permission denied writing {out_path}.")
             print(f"   Fix ownership with: sudo chown -R $USER:$USER {src_dir}")
 
+def check_leakage(df, model_type="tree", max_depth=4):
+    """
+    Leakage Check:
+    1. Asserts feature columns are purely physical telemetry and contain no ground-truth derivations.
+    2. Shuffles the training labels randomly and retrains under GroupKFold by run_id.
+       Macro-F1 must collapse toward chance (~0.20 for 5 classes).
+    """
+    print("\n=======================================================")
+    print("Running Data Leakage & Label Permutation Test")
+    print("=======================================================")
+    FORBIDDEN_COLUMNS = {
+        "true_label", "label", "normalized_label", "op_id", "run_id",
+        "workload", "label_valid", "mismatch_reason", "kernel_cpu_ns",
+        "kernel_sched_wait_ns", "true", "pred", "pred_label"
+    }
+    present_forbidden = [c for c in FEATURE_COLS if c in FORBIDDEN_COLUMNS]
+    if present_forbidden:
+        raise ValueError(f"FATAL LEAKAGE: Forbidden target columns found in FEATURE_COLS: {present_forbidden}")
+    print(f"[PASS] Feature columns verified: 0 forbidden target columns in FEATURE_COLS.")
+
+    X = df[FEATURE_COLS].values
+    y = df["normalized_label"].values
+    groups = df["run_id"].values
+    unique_runs = np.unique(groups)
+
+    rng = np.random.default_rng(42)
+    y_shuffled = rng.permutation(y)
+
+    n_splits = min(len(unique_runs), 4)
+    gkf = GroupKFold(n_splits=n_splits)
+    shuffled_f1s = []
+
+    for fold, (train_idx, test_idx) in enumerate(gkf.split(X, y_shuffled, groups=groups)):
+        X_tr, y_tr = X[train_idx], y_shuffled[train_idx]
+        X_te, y_te = X[test_idx], y_shuffled[test_idx]
+
+        clf = DecisionTreeClassifier(max_depth=max_depth, random_state=42) if model_type == "tree" else LogisticRegression(max_iter=500, random_state=42)
+        clf.fit(X_tr, y_tr)
+        preds = clf.predict(X_te)
+        f1 = f1_score(y_te, preds, average="macro", zero_division=0)
+        shuffled_f1s.append(f1)
+
+    mean_shuffled_f1 = float(np.mean(shuffled_f1s))
+    print(f"Label Shuffle Macro-F1: {mean_shuffled_f1:.4f} (chance level ~0.20)")
+    if mean_shuffled_f1 > 0.45:
+        print("[FAIL] WARNING: Shuffled label macro-F1 is suspiciously high; potential leakage!")
+        return False
+    else:
+        print("[PASS] Verified: Shuffling labels collapses performance toward chance. No leakage detected.")
+        return True
+
 def main():
     parser = argparse.ArgumentParser(description="Lightweight ML Classifier for eBPF Stalls with Abstention")
-    parser.add_argument("paths", nargs="+", help="Run directories or glob patterns (e.g. data/tune/*)")
+    parser.add_argument("paths", nargs="*", help="Run directories or glob patterns (e.g. data/tune/*)")
+    parser.add_argument("--train-dirs", nargs="+", help="Training directories or glob patterns (e.g. data/tune/*)")
+    parser.add_argument("--test-dirs", nargs="+", help="Held-out test directories or glob patterns (e.g. data/final/*)")
     parser.add_argument("--model", choices=["tree", "logistic"], default="tree", help="Classifier type")
     parser.add_argument("--threshold", type=float, default=0.60, help="Abstention threshold tau (default: 0.60)")
     parser.add_argument("--max-depth", type=int, default=4, help="Max depth for DecisionTree")
     parser.add_argument("--out-name", default="pred_tree.jsonl", help="Output filename in each run dir")
+    parser.add_argument("--check-leakage", action="store_true", help="Run label permutation leakage check")
 
     args = parser.parse_args()
 
     if pd is None:
         print("Error: pandas and scikit-learn are required to run analysis/model.py")
+        sys.exit(1)
+
+    # 1. Held-out train-on-tune, predict-on-final workflow
+    if args.train_dirs and args.test_dirs:
+        train_matches = []
+        for p in args.train_dirs:
+            m = glob.glob(p)
+            train_matches.extend([d for d in m if Path(d).is_dir()])
+        test_matches = []
+        for p in args.test_dirs:
+            m = glob.glob(p)
+            test_matches.extend([d for d in m if Path(d).is_dir()])
+
+        print(f"\n=======================================================")
+        print(f"Held-Out Evaluation: Train on Tune ({len(train_matches)} runs) -> Predict on Final ({len(test_matches)} runs)")
+        print(f"=======================================================")
+        train_df = load_dataset(train_matches)
+        test_df = load_dataset(test_matches)
+
+        if train_df.empty or test_df.empty:
+            print("Error: empty train or test dataset.")
+            sys.exit(1)
+
+        # Confirm disjoint groups
+        train_runs = set(train_df["run_id"].unique())
+        test_runs = set(test_df["run_id"].unique())
+        overlap = train_runs.intersection(test_runs)
+        if overlap:
+            raise ValueError(f"CRITICAL ERROR: Run ID overlap between train and test: {overlap}")
+        print(f"Verified 0 run_id overlap between train and held-out test.")
+
+        if args.check_leakage:
+            check_leakage(train_df, model_type=args.model, max_depth=args.max_depth)
+
+        # Train with GroupKFold cross-validation strictly within train_df by run_id
+        model = train_and_evaluate(train_df, model_type=args.model, threshold=args.threshold, max_depth=args.max_depth)
+        if model is None:
+            sys.exit(1)
+
+        # Predict on held-out test_df
+        test_preds = predict_with_abstention(model, test_df, threshold=args.threshold)
+        write_predictions_by_dir(test_preds, out_filename=args.out_name)
+
+        # Report out-of-sample held-out performance if test_df has labels
+        valid_test = test_df[test_df["normalized_label"] != "UNKNOWN"]
+        if not valid_test.empty:
+            pred_map = {(p["run_id"], p["op_id"]): p["pred"] for p in test_preds}
+            y_true = [row["normalized_label"] for _, row in valid_test.iterrows()]
+            y_pred = [pred_map.get((row["run_id"], int(row["op_id"])), "INDETERMINATE") for _, row in valid_test.iterrows()]
+            decided = [(t, p) for t, p in zip(y_true, y_pred) if p != "INDETERMINATE"]
+            if decided:
+                d_true, d_pred = zip(*decided)
+                acc = accuracy_score(d_true, d_pred)
+                mf1 = f1_score(d_true, d_pred, average="macro", zero_division=0)
+                cov = len(decided) / len(y_true) * 100.0
+                print(f"\n[Held-Out Test Results]")
+                print(f"  Coverage: {cov:.1f}% ({len(decided)}/{len(y_true)} operations answered)")
+                print(f"  Accuracy (Answered): {acc*100:.2f}%")
+                print(f"  Macro-F1 (Answered): {mf1:.4f}")
+        return
+
+    # 2. Legacy / Single-set workflow with GroupKFold cross-validation
+    if not args.paths:
+        print("Error: must provide either positional run paths or --train-dirs and --test-dirs.")
+        parser.print_help()
         sys.exit(1)
 
     matched_dirs = []
@@ -236,6 +363,9 @@ def main():
     if df.empty:
         print("No feature records found in given directories.")
         sys.exit(1)
+
+    if args.check_leakage:
+        check_leakage(df, model_type=args.model, max_depth=args.max_depth)
 
     model = train_and_evaluate(df, model_type=args.model, threshold=args.threshold, max_depth=args.max_depth)
     if model is None:

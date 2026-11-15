@@ -13,7 +13,7 @@ except ImportError:
 
 import csv
 
-def validate_label_signature(label: str, dur_ms: float, on_cpu_r: float, sched_r: float, io_sleep_r: float, blk_issues: int, n_ctx: int) -> tuple[bool, str]:
+def validate_label_signature(label: str, dur_ms: float, on_cpu_r: float, sched_r: float, io_sleep_r: float, blk_issues: int, n_ctx: int, total_block_bytes: int = 0, expected_bytes: int = 0) -> tuple[bool, str]:
     if label == "CPU_SYSCALL":
         if blk_issues > 0:
             return False, f"CPU_SYSCALL had {blk_issues} block requests"
@@ -27,6 +27,8 @@ def validate_label_signature(label: str, dur_ms: float, on_cpu_r: float, sched_r
             return False, "IO_WAIT had zero block issues"
         if io_sleep_r == 0:
             return False, "IO_WAIT had zero D-state sleep"
+        if expected_bytes > 0 and total_block_bytes < expected_bytes:
+            return False, f"IO_WAIT had block bytes ({total_block_bytes}) less than requested read size ({expected_bytes})"
         return True, ""
     elif label == "WARM_READ":
         if blk_issues > 0:
@@ -38,7 +40,7 @@ def validate_label_signature(label: str, dur_ms: float, on_cpu_r: float, sched_r
         if sched_r == 0 and n_ctx == 0:
             return False, "SCHED_WAIT had zero runqueue delay and zero context switches"
         return True, ""
-    elif label == "NEGATIVE_CONTROL":
+    elif label in ("NEGATIVE_CONTROL", "INDETERMINATE"):
         return True, ""
     return True, ""
 
@@ -144,7 +146,13 @@ def correlate_single_run(run_dir: str):
 
             # L4: Softirq service time (Layer 4)
             irq_events = w_events[w_events.layer == 4]
-            softirq_ns = int(irq_events["ret"].sum()) if not irq_events.empty else 0
+            if not irq_events.empty:
+                if "dur_ns" in irq_events.columns:
+                    softirq_ns = int(irq_events["dur_ns"].sum())
+                else:
+                    softirq_ns = int(irq_events["ret"].sum())
+            else:
+                softirq_ns = 0
 
             # 2. Scheduler state breakdown (Layer 2)
             sched_events = t_events[t_events.layer == 2]
@@ -152,6 +160,8 @@ def correlate_single_run(run_dir: str):
             on_cpu_ns = 0
             sched_wait_ns = 0
             io_sleep_ns = 0
+            other_sleep_ns = 0
+            unknown_ns = 0
 
             last_ts = t_start
             curr_state = "RUNNING"
@@ -164,6 +174,10 @@ def correlate_single_run(run_dir: str):
                     sched_wait_ns += dt
                 elif curr_state == "SLEEP_D":
                     io_sleep_ns += dt
+                elif curr_state == "SLEEP_OTHER":
+                    other_sleep_ns += dt
+                else:
+                    unknown_ns += dt
 
                 # State transition
                 if row.type == 0:  # switch_out
@@ -172,8 +186,10 @@ def correlate_single_run(run_dir: str):
                         curr_state = "RUNNABLE"
                     elif prev_st == 2:
                         curr_state = "SLEEP_D"
-                    else:
+                    elif prev_st == 1:
                         curr_state = "SLEEP_OTHER"
+                    else:
+                        curr_state = "UNKNOWN"
                 elif row.type == 1:  # switch_in
                     curr_state = "RUNNING"
                 elif row.type == 2:  # wakeup
@@ -188,6 +204,10 @@ def correlate_single_run(run_dir: str):
                 sched_wait_ns += final_dt
             elif curr_state == "SLEEP_D":
                 io_sleep_ns += final_dt
+            elif curr_state == "SLEEP_OTHER":
+                other_sleep_ns += final_dt
+            else:
+                unknown_ns += final_dt
 
             # 3. Syscall counts (Layer 1)
             sys_enters = len(t_events[(t_events.layer == 1) & (t_events.type == 0)])
@@ -207,12 +227,14 @@ def correlate_single_run(run_dir: str):
             n_blk_bg = max(block_issues - n_blk_direct, 0)
 
             irq_rows = [r for r in w_rows if int(r["layer"]) == 4]
-            softirq_ns = sum(int(r.get("ret", 0)) for r in irq_rows)
+            softirq_ns = sum(int(r.get("dur_ns", r.get("ret", 0))) for r in irq_rows)
 
             sched_rows = [r for r in t_rows if int(r["layer"]) == 2]
             on_cpu_ns = 0
             sched_wait_ns = 0
             io_sleep_ns = 0
+            other_sleep_ns = 0
+            unknown_ns = 0
 
             last_ts = t_start
             curr_state = "RUNNING"
@@ -226,6 +248,10 @@ def correlate_single_run(run_dir: str):
                     sched_wait_ns += dt
                 elif curr_state == "SLEEP_D":
                     io_sleep_ns += dt
+                elif curr_state == "SLEEP_OTHER":
+                    other_sleep_ns += dt
+                else:
+                    unknown_ns += dt
 
                 stype = int(r["type"])
                 if stype == 0:
@@ -234,8 +260,10 @@ def correlate_single_run(run_dir: str):
                         curr_state = "RUNNABLE"
                     elif pst == 2:
                         curr_state = "SLEEP_D"
-                    else:
+                    elif pst == 1:
                         curr_state = "SLEEP_OTHER"
+                    else:
+                        curr_state = "UNKNOWN"
                 elif stype == 1:
                     curr_state = "RUNNING"
                 elif stype == 2:
@@ -250,20 +278,44 @@ def correlate_single_run(run_dir: str):
                 sched_wait_ns += final_dt
             elif curr_state == "SLEEP_D":
                 io_sleep_ns += final_dt
+            elif curr_state == "SLEEP_OTHER":
+                other_sleep_ns += final_dt
+            else:
+                unknown_ns += final_dt
 
             sys_enters = sum(1 for r in t_rows if int(r["layer"]) == 1 and int(r["type"]) == 0)
             n_ctx_switch = sum(1 for r in sched_rows if int(r["type"]) == 0)
 
-        # L3: Time breakdown partitioning: T = t_run + t_runnable + t_blocked
-        total_sleep_ns = max(op_duration_ns - on_cpu_ns - sched_wait_ns, 0)
-        io_sleep_ns = min(io_sleep_ns, total_sleep_ns)
-        other_sleep_ns = total_sleep_ns - io_sleep_ns
+        # Direct time breakdown partitioning: T = t_run + t_runnable + t_blocked + unknown_ns + residual_ns
+        total_blocked_ns = io_sleep_ns + other_sleep_ns
+        t_blocked = total_blocked_ns
+        t_runnable = sched_wait_ns
+        t_run = on_cpu_ns
+
+        # Note on residual_ns:
+        # residual_ns = op_duration_ns - (t_run + t_runnable + t_blocked + unknown_ns).
+        # By construction, when events form a valid contiguous state sequence within [t_start, t_end],
+        # every nanosecond is accounted for by dt = ts - last_ts, so residual_ns is zero.
+        # It becomes non-zero only under anomalous trace conditions: unpaired switches (e.g. switch_out
+        # without subsequent switch_in before t_end), dropped/lost ring-buffer events, or timestamp
+        # non-monotonicities.
+        # Note: residual_ns is an internal trace consistency check, NOT a ground-truth validation result.
+        # Physical validation is the comparison against independent kernel accounting: cpu_gap_ns and wait_gap_ns.
+        sum_measured_ns = t_run + t_runnable + t_blocked + unknown_ns
+        residual_ns = op_duration_ns - sum_measured_ns
+        residual_ratio = round(residual_ns / op_duration_ns, 4) if op_duration_ns > 0 else 0.0
+
+        # Independent kernel accounting comparisons (validation metrics)
+        k_cpu = int(op.get("kernel_cpu_ns", 0))
+        k_wait = int(op.get("kernel_sched_wait_ns", 0))
+        cpu_gap_ns = t_run - k_cpu
+        wait_gap_ns = t_runnable - k_wait
 
         dur_ms = round(op_duration_ns / 1e6, 4)
-        on_cpu_ratio = round(min(on_cpu_ns / op_duration_ns, 1.0), 4)
-        sched_wait_ratio = round(min(sched_wait_ns / op_duration_ns, 1.0), 4)
+        on_cpu_ratio = round(min(t_run / op_duration_ns, 1.0), 4)
+        sched_wait_ratio = round(min(t_runnable / op_duration_ns, 1.0), 4)
         io_sleep_ratio = round(min(io_sleep_ns / op_duration_ns, 1.0), 4)
-        sleep_state_frac = round(io_sleep_ns / total_sleep_ns, 4) if total_sleep_ns > 0 else 0.0
+        sleep_state_frac = round(io_sleep_ns / total_blocked_ns, 4) if total_blocked_ns > 0 else 0.0
         blk_overlap_frac = round(min(io_sleep_ns / op_duration_ns, 1.0), 4) if block_issues > 0 else 0.0
 
         # L1: Robust spike score
@@ -285,8 +337,10 @@ def correlate_single_run(run_dir: str):
             ev_flags |= 32
 
         # L6: Label validation
+        expected_bytes = int(op.get("bytes", 0))
         is_valid, reason = validate_label_signature(
-            norm_label, dur_ms, on_cpu_ratio, sched_wait_ratio, io_sleep_ratio, block_issues, n_ctx_switch
+            norm_label, dur_ms, on_cpu_ratio, sched_wait_ratio, io_sleep_ratio, block_issues, n_ctx_switch,
+            total_block_bytes, expected_bytes
         )
         validation_records.append({
             "op_id": op.get("op_id", 0),
@@ -304,11 +358,18 @@ def correlate_single_run(run_dir: str):
             "on_cpu_ratio": on_cpu_ratio,
             "sched_wait_ratio": sched_wait_ratio,
             "io_sleep_ratio": io_sleep_ratio,
-            "t_run": on_cpu_ns,
-            "t_runnable": sched_wait_ns,
-            "t_blocked": total_sleep_ns,
+            "t_run": t_run,
+            "t_runnable": t_runnable,
+            "kernel_cpu_ns": k_cpu,
+            "kernel_sched_wait_ns": k_wait,
+            "cpu_gap_ns": cpu_gap_ns,
+            "wait_gap_ns": wait_gap_ns,
+            "t_blocked": t_blocked,
             "t_iowait": io_sleep_ns,
             "t_other_sleep": other_sleep_ns,
+            "unknown_ns": unknown_ns,
+            "residual_ns": residual_ns,
+            "residual_ratio": residual_ratio,
             "softirq_ns": softirq_ns,
             "med_dur_ns": med_dur_ns,
             "mad_dur_ns": mad_dur_ns,
@@ -354,6 +415,17 @@ def correlate_single_run(run_dir: str):
         print(f"[correlate] error: permission denied writing features to {run_dir}.")
         print(f"   Fix ownership with: sudo chown -R $USER:$USER {run_dir}")
 
+    if features:
+        res_list = [f["residual_ns"] for f in features]
+        cpu_gaps = [f["cpu_gap_ns"] for f in features]
+        wait_gaps = [f["wait_gap_ns"] for f in features]
+        unk_list = [f["unknown_ns"] for f in features]
+        print(f"[correlate] Trace residual (ns) on {run_id}: min={min(res_list)}, mean={sum(res_list)/len(res_list):.1f}, max={max(res_list)}")
+        print(f"[correlate] Kernel CPU gap (ns) [t_run - kernel_cpu]: min={min(cpu_gaps)}, mean={sum(cpu_gaps)/len(cpu_gaps):.1f}, max={max(cpu_gaps)}")
+        print(f"[correlate] Kernel wait gap (ns) [t_runnable - kernel_wait]: min={min(wait_gaps)}, mean={sum(wait_gaps)/len(wait_gaps):.1f}, max={max(wait_gaps)}")
+        if any(u > 0 for u in unk_list):
+            print(f"[correlate] Unknown state time (ns): min={min(unk_list)}, mean={sum(unk_list)/len(unk_list):.1f}, max={max(unk_list)}")
+
     # L6: Save label validation report
     n_ops = len(validation_records)
     n_valid = sum(1 for v in validation_records if v["valid"])
@@ -368,8 +440,11 @@ def correlate_single_run(run_dir: str):
         "label_noise_rate": noise_rate,
         "details": validation_records
     }
-    with open(out_val_json, "w") as f:
-        json.dump(val_summary, f, indent=2)
+    try:
+        with open(out_val_json, "w") as f:
+            json.dump(val_summary, f, indent=2)
+    except PermissionError:
+        pass
 
     print(f"[correlate] Label validation: {n_valid}/{n_ops} valid (noise rate: {noise_rate*100:.1f}%)")
 

@@ -219,7 +219,7 @@ int on_block_bio_queue(struct trace_event_raw_block_bio *ctx)
         e->sector = ctx->sector;
         e->nr_bytes = ctx->nr_sector << 9;
         e->target_tid = tid;
-        __builtin_memcpy(e->rwbs, ctx->rwbs, sizeof(e->rwbs));
+        bpf_probe_read_kernel(e->rwbs, sizeof(e->rwbs), &ctx->rwbs);
         bpf_ringbuf_submit(e, 0);
     }
     return 0;
@@ -238,7 +238,7 @@ int on_block_rq_issue(struct trace_event_raw_block_rq *ctx)
     e->dev = ctx->dev;
     e->sector = ctx->sector;
     e->nr_bytes = ctx->bytes;
-    __builtin_memcpy(e->rwbs, ctx->rwbs, sizeof(e->rwbs));
+    bpf_probe_read_kernel(e->rwbs, sizeof(e->rwbs), &ctx->rwbs);
 
     struct bio_key key = {
         .dev = ctx->dev,
@@ -267,7 +267,7 @@ int on_block_rq_complete(struct trace_event_raw_block_rq_completion *ctx)
     e->sector = ctx->sector;
     e->nr_bytes = ctx->nr_sector << 9;
     e->ret = ctx->error;
-    __builtin_memcpy(e->rwbs, ctx->rwbs, sizeof(e->rwbs));
+    bpf_probe_read_kernel(e->rwbs, sizeof(e->rwbs), &ctx->rwbs);
 
     struct bio_key key = {
         .dev = ctx->dev,
